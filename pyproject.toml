@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "luch-launcher"
+version = "0.1.0"
+description = "A minimal native Wayland launcher with apps, shell and local AI"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = ["PyGObject>=3.42", "pycairo>=1.20"]
+
+[project.scripts]
+luch = "luch.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["luch*"]

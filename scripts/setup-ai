@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Connect Luch to an existing OpenAI-compatible service without starting a server."""
+
+from pathlib import Path
+
+import argparse
+import sys
+import os
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from luch.config import Config
+from luch.ai import AiClient
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--endpoint', default='http://127.0.0.1:11434/v1')
+    parser.add_argument('--model', default='qwen3:4b-instruct-2507-q4_K_M')
+    parser.add_argument('--api-key-env', help='Read the API key from this environment variable')
+    args = parser.parse_args()
+    values = {'endpoint': args.endpoint, 'model': args.model, 'api_format': 'openai', 'api_key': ''}
+    if args.api_key_env:
+        values['api_key'] = os.environ.get(args.api_key_env, '').strip()
+        if not values['api_key']:
+            parser.error('The selected API key environment variable is empty')
+    config = Config()
+    try:
+        config.update_ai(values)
+    except (ValueError, OSError) as error:
+        parser.exit(1, f'Could not save AI connection: {error}\n')
+    print(AiClient(config.data).check_connection())
+    print('AI connection saved. Open Luch settings to change the address, API key or model.')
+    print('The configured service is managed independently from Luch.')
+
+
+if __name__ == '__main__':
+    main()

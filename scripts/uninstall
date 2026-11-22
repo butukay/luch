@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Remove Luch's user integration, preserving custom config and later edits."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def reload_waybar(config_path: Path) -> None:
+    """Reload only a same-user Waybar displaying this exact configuration."""
+    import signal
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            argv = (proc / 'cmdline').read_bytes().decode().strip('\0').split('\0')
+            if not argv or Path(argv[0]).name != 'waybar':
+                continue
+            configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg in ('-c', '--config')]
+            configs.extend(arg.split('=', 1)[1] for arg in argv if arg.startswith('--config='))
+            if any(Path(path).expanduser().resolve() == config_path.resolve() for path in configs):
+                os.kill(int(proc.name), signal.SIGUSR2)
+        except (OSError, ValueError, UnicodeError):
+            continue
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep-ai', action='store_true', help='leave the dedicated AI service running')
+    args = parser.parse_args()
+    home = Path.home()
+    config = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config'))
+    state = Path(os.environ.get('XDG_STATE_HOME', home / '.local/state')) / 'luch'
+    journal_path = state / 'install.json'
+    try:
+        journal = json.loads(journal_path.read_text())
+    except FileNotFoundError:
+        print(f'No installation journal at {journal_path}; nothing changed.')
+        return 0
+    if journal.get('version') != 1:
+        parser.error('unsupported installation journal version')
+    if shutil.which('systemctl'):
+        subprocess.run(['systemctl', '--user', 'disable', '--now', 'luch.service'], capture_output=True)
+        if not args.keep_ai:
+            # AI setup is independent; stopping this exact unit preserves its files and model cache.
+            subprocess.run(['systemctl', '--user', 'disable', '--now', 'luch-ai.service'], capture_output=True)
+    launcher = Path(__file__).resolve().parents[1] / 'bin/luch'
+    if launcher.is_file():
+        subprocess.run([sys.executable, launcher, 'quit'], capture_output=True)
+    pending_patches, pending_files = [], []
+    for item in reversed(journal['patches']):
+        path = Path(item['path'])
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            continue
+        before, after = item['before'], item['after']
+        if text.count(after) == 1:
+            temporary = path.with_name(path.name + '.luch-tmp')
+            temporary.write_text(text.replace(after, before, 1))
+            os.replace(temporary, path)
+        elif before not in text:
+            print(f'Preserved changed launcher fragment: {path}', file=sys.stderr)
+            pending_patches.append(item)
+    for item in reversed(journal['files']):
+        path = Path(item['path'])
+        if not path.exists() and not path.is_symlink():
+            continue
+        if item.get('link'):
+            unchanged = path.is_symlink() and str(path.readlink()) == item['link']
+        else:
+            unchanged = path.is_file() and not path.is_symlink() and path.read_text() == item.get('content', '')
+        if not unchanged:
+            print(f'Preserved changed file: {path}', file=sys.stderr)
+            pending_files.append(item)
+            continue
+        path.unlink()
+        backup = Path(item['backup']) if item.get('backup') else None
+        if backup and (backup.exists() or backup.is_symlink()):
+            if backup.is_symlink():
+                path.symlink_to(backup.readlink())
+            else:
+                shutil.copy2(backup, path)
+    if pending_files or pending_patches:
+        journal['files'] = list(reversed(pending_files))
+        journal['patches'] = list(reversed(pending_patches))
+        journal_path.write_text(json.dumps(journal, indent=2, ensure_ascii=False) + '\n')
+    else:
+        journal_path.unlink()
+    if shutil.which('systemctl'):
+        subprocess.run(['systemctl', '--user', 'daemon-reload'], capture_output=True)
+    if os.environ.get('SWAYSOCK') and shutil.which('swaymsg'):
+        subprocess.run(['swaymsg', 'reload'], capture_output=True)
+    reload_waybar(config / 'sway/waybar/config')
+    print(f'Luch integration removed. Config and model cache preserved in {config / "luch"} and local data.')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Install Luch for the current user; retain a reversible integration journal."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', HOME / '.config'))
+DATA = Path(os.environ.get('XDG_DATA_HOME', HOME / '.local/share'))
+STATE = Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'luch'
+JOURNAL = STATE / 'install.json'
+BIN = HOME / '.local/bin/luch'
+
+
+def run(*args: str, required: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(args, text=True, capture_output=True)
+    if required and result.returncode:
+        raise RuntimeError(f"{' '.join(args)}: {result.stderr.strip() or result.stdout.strip()}")
+    return result
+
+
+def atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.luch-tmp')
+    temporary.write_text(content)
+    os.replace(temporary, path)
+
+
+def reload_waybar(config_path: Path) -> None:
+    """Reload only a same-user Waybar displaying this exact configuration."""
+    import signal
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            argv = (proc / 'cmdline').read_bytes().decode().strip('\0').split('\0')
+            if not argv or Path(argv[0]).name != 'waybar':
+                continue
+            configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg in ('-c', '--config')]
+            configs.extend(arg.split('=', 1)[1] for arg in argv if arg.startswith('--config='))
+            if any(Path(path).expanduser().resolve() == config_path.resolve() for path in configs):
+                os.kill(int(proc.name), signal.SIGUSR2)
+        except (OSError, ValueError, UnicodeError):
+            continue
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--no-start', action='store_true', help='install without starting the daemon')
+    parser.add_argument('--no-integrate', action='store_true', help='do not change Sway or Waybar')
+    args = parser.parse_args()
+    if not (ROOT / 'bin/luch').is_file():
+        parser.error('bin/luch is missing; complete the source checkout first')
+    if sys.version_info < (3, 11):
+        parser.error('Luch requires Python 3.11 or newer')
+    try:
+        import gi
+        gi.require_version('Gtk', '3.0')
+        gi.require_version('GtkLayerShell', '0.1')
+        gi.require_foreign('cairo')
+    except (ImportError, ValueError) as error:
+        parser.error(f'{error}; install PyGObject, Cairo, GTK 3 and GTK Layer Shell')
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    try:
+        journal = json.loads(JOURNAL.read_text())
+    except FileNotFoundError:
+        journal = {'version': 1, 'files': [], 'patches': [], 'root': str(ROOT)}
+    if journal.get('version') != 1:
+        parser.error(f'unsupported journal: {JOURNAL}')
+    stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    backup = STATE / 'backups' / stamp
+
+    def save_journal() -> None:
+        atomic(JOURNAL, json.dumps(journal, indent=2, ensure_ascii=False) + '\n')
+
+    def install_file(path: Path, content: str | None = None, link: Path | None = None) -> None:
+        owned = next((entry for entry in journal['files'] if entry['path'] == str(path)), None)
+        current_link = str(path.readlink()) if path.is_symlink() else None
+        current = path.read_text() if path.is_file() and not path.is_symlink() else None
+        if owned:
+            expected = owned.get('content')
+            expected_link = owned.get('link')
+            if (expected_link and current_link != expected_link) or (expected is not None and current != expected):
+                raise RuntimeError(f'{path} changed since installation; leaving it untouched')
+        else:
+            saved = None
+            if path.exists() or path.is_symlink():
+                backup.mkdir(parents=True, exist_ok=True)
+                saved = backup / str(path).lstrip('/').replace('/', '__')
+                if path.is_symlink():
+                    saved.symlink_to(path.readlink())
+                else:
+                    shutil.copy2(path, saved)
+            owned = {'path': str(path), 'backup': str(saved) if saved else None}
+            journal['files'].append(owned)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if link:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            path.symlink_to(link)
+            owned.pop('content', None)
+            owned['link'] = str(link)
+        else:
+            if path.is_symlink():
+                path.unlink()
+            atomic(path, content or '')
+            owned.pop('link', None)
+            owned['content'] = content
+        save_journal()
+
+    def patch(path: Path, before: str, after: str) -> None:
+        if not path.is_file() or before == after:
+            return
+        text = path.read_text()
+        if after in text:
+            return
+        if text.count(before) != 1:
+            print(f'Skip integration of {path}: expected launcher fragment was not unique.')
+            return
+        backup.mkdir(parents=True, exist_ok=True)
+        saved = backup / str(path).lstrip('/').replace('/', '__')
+        shutil.copy2(path, saved)
+        atomic(path, text.replace(before, after, 1))
+        journal['patches'].append({'path': str(path), 'before': before, 'after': after, 'backup': str(saved)})
+        save_journal()
+
+    try:
+        install_file(BIN, link=ROOT / 'bin/luch')
+        unit = (ROOT / 'packaging/luch.service').read_text().replace('@ROOT@', str(ROOT).replace('\\', '\\\\').replace('"', '\\"'))
+        install_file(CONFIG / 'systemd/user/luch.service', content=unit)
+        desktop = (ROOT / 'packaging/luch.desktop').read_text().replace('@BIN@', str(BIN))
+        install_file(DATA / 'applications/luch.desktop', content=desktop)
+        icon = ROOT / 'assets/luch.svg'
+        if icon.is_file():
+            install_file(DATA / 'icons/hicolor/scalable/apps/luch.svg', content=icon.read_text())
+        if not args.no_integrate:
+            sway = CONFIG / 'sway/config'
+            if sway.is_file():
+                text = sway.read_text()
+                match = re.search(r'^set\s+\$menu\s+fuzzel\s*$', text, re.MULTILINE)
+                if match:
+                    # Avoid a regexp's trailing whitespace absorbing the next blank line.
+                    before = match.group(0).rstrip('\n')
+                    patch(sway, before, f'set $menu {BIN} toggle')
+            waybar = CONFIG / 'sway/waybar/config'
+            if waybar.is_file():
+                text = waybar.read_text()
+                # Patch only the fuzzel action inside the launcher module.
+                match = re.search(r'"custom/launcher"\s*:\s*\{[^{}]*\}', text, re.DOTALL)
+                if match:
+                    fragment = match.group(0)
+                    action = re.search(r'("on-click"\s*:\s*)"fuzzel"', fragment)
+                    if action:
+                        patch(waybar, action.group(0), action.group(1) + json.dumps(f'{BIN} toggle'))
+        if shutil.which('systemctl') and run('systemctl', '--user', 'show-environment', required=False).returncode == 0:
+            run('systemctl', '--user', 'daemon-reload')
+            environment = [key for key in ('WAYLAND_DISPLAY', 'DISPLAY', 'SWAYSOCK', 'XDG_CURRENT_DESKTOP', 'XDG_SESSION_TYPE', 'XDG_RUNTIME_DIR') if os.environ.get(key)]
+            if environment:
+                run('systemctl', '--user', 'import-environment', *environment)
+            if not args.no_start:
+                was_active = run('systemctl', '--user', 'is-active', '--quiet', 'luch.service', required=False).returncode == 0
+                run('systemctl', '--user', 'enable', '--now', 'luch.service')
+                if was_active:
+                    run('systemctl', '--user', 'restart', 'luch.service')
+        elif not args.no_start:
+            print('User systemd is unavailable. Luch will start when you run luch toggle.')
+        if os.environ.get('SWAYSOCK') and not args.no_integrate and shutil.which('swaymsg'):
+            result = run('swaymsg', 'reload', required=False)
+            if result.returncode:
+                print(f'Sway reload: {result.stderr.strip() or result.stdout.strip()}', file=sys.stderr)
+        if not args.no_integrate:
+            reload_waybar(CONFIG / 'sway/waybar/config')
+        if shutil.which('update-desktop-database'):
+            run('update-desktop-database', str(DATA / 'applications'), required=False)
+        print(f'Luch installed: {BIN}')
+        print(f'Config: {CONFIG / "luch/config.toml"}')
+        print(f'Reversible integration journal: {JOURNAL}')
+        return 0
+    except (OSError, RuntimeError) as error:
+        print(f'Installation stopped: {error}\nChanges already made are recorded in {JOURNAL}.', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

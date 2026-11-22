@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Luch
+Name[ru]=Луч
+Comment=Apps, shell and local AI in one minimal launcher
+Comment[ru]=Приложения, shell и локальный ИИ
+Exec="@BIN@" toggle
+Icon=luch
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+NoDisplay=true
