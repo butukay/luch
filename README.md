@@ -11,7 +11,7 @@
 Выполни в терминале от своего пользователя. Нужен `curl`.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/butukay/luch/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/butukay/luch/refs/heads/master/install.sh | bash
 ```
 
 Для окна нужна Wayland-сессия с протоколом [Layer Shell](https://github.com/wmww/gtk-layer-shell#supported-desktops), например Sway, Hyprland, labwc или KDE Plasma на Wayland. Установщик ставит недостающие зависимости через `sudo` в Arch Linux, Debian 12+, Ubuntu 24.04+ и Fedora. Для других дистрибутивов заранее установи системный Python 3.11+, PyGObject, Cairo, GTK 3 и GTK Layer Shell.
