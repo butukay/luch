@@ -102,13 +102,14 @@ install_dependencies() {
         fail "${PRETTY_NAME:-This distribution} provides an older system Python. Luch requires Python 3.11 or newer."
     fi
 
-    local -a setup=() install
+    local -a setup=() sudo_env=() install
     case " $ID $ID_LIKE " in
         *' arch '*)
             install=(pacman -S --needed --noconfirm python python-gobject python-cairo gtk3 gtk-layer-shell librsvg)
             ;;
         *' debian '*|*' ubuntu '*)
             setup=(apt-get update)
+            sudo_env=(DEBIAN_FRONTEND=noninteractive)
             install=(apt-get install -y --no-install-recommends python3 python3-gi python3-gi-cairo
                 gir1.2-gtk-3.0 gir1.2-gtklayershell-0.1 librsvg2-common)
             ;;
@@ -124,7 +125,7 @@ install_dependencies() {
     if (( ${#setup[@]} )); then
         sudo "${setup[@]}" </dev/null
     fi
-    sudo "${install[@]}" </dev/null
+    sudo "${sudo_env[@]}" "${install[@]}" </dev/null
 }
 
 cleanup_install() {
